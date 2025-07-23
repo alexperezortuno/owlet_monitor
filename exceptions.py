@@ -1,0 +1,2 @@
+class OwletError(Exception):
+    pass
