@@ -1,25 +1,67 @@
 import csv
-import json
 import os
 import platform
 import sys
 import time
+import json
+import logging
+from dataclasses import dataclass
 from datetime import datetime
 from traceback import format_exception
+from typing import Optional, Dict, Any, List
+from urllib.parse import urljoin
 
-import requests
+import aiohttp
+from aiohttp import ClientResponse
 
-from api.utils import vitals_from_dict, VitalsAnalyzer
+from api.utils import VitalsAnalyzer, vitals_from_dict
 from exceptions import OwletError
 from utils.config import Config
 
 
+logger = logging.getLogger(__name__)
+
+@dataclass
+class AuthResponse:
+    id_token: str
+    mini_token: str
+    access_token: str
+    expires_in: int
+
+@dataclass
+class DeviceEndpoints:
+    dsn: str
+    properties_url: str
+    activate_url: str
+
+class DeviceManager:
+    def __init__(self):
+        self.devices: List[DeviceEndpoints] = []
+
+    def add_device(self, device: DeviceEndpoints) -> None:
+        self.devices.append(device)
+
+    def clear_devices(self) -> None:
+        self.devices.clear()
+
+    def set_devices(self, devices: List[DeviceEndpoints]) -> None:
+        self.devices = devices
+
+
+
 class OwletClient:
+    ANDROID_HEADERS = {
+        'X-Android-Package': 'com.owletcare.owletcare',
+        'X-Android-Cert': '2A3BC26DB0B8B0792DBE28E6FFDC2598F9B12B74'
+    }
+
     analyzer: VitalsAnalyzer | None = None
 
     def __init__(self, config: Config = None):
-        self.conf = config
+        self.config = config
+        self._session: Optional[aiohttp.ClientSession] = None
         self.analyzer = VitalsAnalyzer()
+        self.devices = DeviceManager()
 
     def log(self, s) -> None:
         sys.stderr.write(s + '\n')
@@ -29,97 +71,124 @@ class OwletClient:
         sys.stdout.write(s + '\n')
         sys.stdout.flush()
 
-    def login(self) -> None:
-        try:
-            owlet_user, owlet_pass = self.conf.get_user(), self.conf.get_password()
-            owlet_region = self.conf.get_region()
-            if not len(owlet_user):
-                raise OwletError("OWLET_USER is empty")
-            if not len(owlet_pass):
-                raise OwletError("OWLET_PASS is empty")
-        except KeyError as e:
-            raise OwletError("OWLET_USER or OWLET_PASS env var is not defined")
+    async def fetch_dsn_async(self) -> List[DeviceEndpoints]:
+        """
+        Fetches Device Serial Numbers (DSN) and related endpoints for all available Owlet monitors.
 
-        if owlet_region is None:
-            raise OwletError("OWLET_REGION env var '{}' not recognised - must be one of {}".format(
-                owlet_region, self.conf.region_config.keys()))
+        Returns:
+            List[DeviceEndpoints]: List of device endpoints for each found monitor
 
-        if self.conf.get_token() is not None and (self.conf.get_expire_time() > time.time()):
+        Raises:
+            OwletError: If no Owlet monitors are found or if the request fails
+        """
+        if self.config.get_dsn():
+            logger.debug("Using cached DSN information")
             return
 
-        self.log('Logging in')
-        # authenticate against Firebase, get the JWT.
-        # need to pass the X-Android-Package and X-Android-Cert headers because
-        # the API key is restricted to the Owlet Android app
-        # https://cloud.google.com/docs/authentication/api-keys#api_key_restrictions
-        api_key = self.conf.region_config[owlet_region]['apiKey']
-        r = requests.post(f'https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key={api_key}',
-                          data=json.dumps({'email': owlet_user, 'password': owlet_pass, 'returnSecureToken': True}),
-                          headers={
-                              'X-Android-Package': 'com.owletcare.owletcare',
-                              'X-Android-Cert': '2A3BC26DB0B8B0792DBE28E6FFDC2598F9B12B74'
-                          })
-        r.raise_for_status()
-        jwt = r.json()['idToken']
-        # authenticate against owletdata.com, get the mini_token
-        r = requests.get(self.conf.region_config[owlet_region]
-                         ['url_mini'], headers={'Authorization': jwt})
-        r.raise_for_status()
-        mini_token = r.json()['mini_token']
-        # authenticate against Ayla, get the access_token
-        r = requests.post(self.conf.region_config[owlet_region]['url_signin'], json={
-            "app_id": self.conf.region_config[owlet_region]['app_id'],
-            "app_secret": self.conf.region_config[owlet_region]['app_secret'],
-            "provider": "owl_id",
-            "token": mini_token,
-        })
-        r.raise_for_status()
-        auth_token = r.json()['access_token']
-        # we will re-auth 60 seconds before the token expires
-        self.conf.set_expire_time(time.time() + r.json()['expires_in'] - 60)
-        self.conf.add_headers({'Authorization': f'auth_token {auth_token}'})
-        self.log('Auth token %s' % auth_token)
+        try:
+            logger.info("Fetching device information")
+
+            # Construct base URL for the API request
+            base_url = self.config.get_region_config().get('url_base')
+            devices_url = f"{base_url}/devices.json"
+
+            # Fetch devices information
+            response: ClientResponse = await self._make_request(
+                'GET',
+                devices_url,
+                headers=self.config.get_headers()
+            )
+
+            if not response:
+                raise OwletError('No response received from devices endpoint')
+
+            devices: list = []
+            for d in response:
+                devices.append(d.get('device', {}))
+
+            if not devices:
+                raise OwletError('Found zero Owlet monitors')
+
+            # Clear existing device information
+            self.config.set_dsn([])
+            self.config.set_props([])
+            self.config.set_activate([])
+
+            # Process each device
+            for device in devices:
+                device_sn = device.get('dsn')
+                if not device_sn:
+                    logger.warning("Found device without DSN, skipping")
+                    continue
+
+                # Create endpoint URLs for the device
+                device_endpoints = DeviceEndpoints(
+                    dsn=device_sn,
+                    properties_url=f"{base_url}/dsns/{device_sn}/properties.json",
+                    activate_url=f"{base_url}/dsns/{device_sn}/properties/APP_ACTIVE/datapoints.json"
+                )
+
+                # Update configuration with new device information
+                self.config.append_dsn(device_endpoints.dsn)
+                self.config.append_props(device_endpoints.properties_url)
+                self.config.append_activate(device_endpoints.activate_url)
+
+                logger.info(
+                    f'Found Owlet monitor device serial number {device_endpoints.dsn}'
+                )
+
+            logger.info(f'Successfully fetched {len(devices)} devices')
+            self.devices.set_devices(devices)
+            return devices
+
+        except aiohttp.ClientError as e:
+            logger.error(f"Network error while fetching DSN: {e}")
+            raise OwletError(f"Failed to fetch device information: {str(e)}") from e
+
+        except Exception as e:
+            logger.error(f"Unexpected error while fetching DSN: {e}")
+            raise OwletError(f"Unexpected error: {str(e)}") from e
 
     def fetch_dsn(self):
-        if len(self.conf.get_dsn()) == 0:
+        if len(self.config.get_dsn()) == 0:
             self.log('Getting DSN')
-            r = self.conf.get_session().get(self.conf.get_region_config().get('url_base') + '/devices.json',
-                                            headers=self.conf.get_headers())
+            r = self.config.get_session().get(self.config.get_region_config().get('url_base') + '/devices.json',
+                                            headers=self.config.get_headers())
             r.raise_for_status()
             devs = r.json()
             if len(devs) < 1:
                 raise OwletError('Found zero Owlet monitors')
             # Allow for multiple devices
-            self.conf.set_dsn([])
-            self.conf.set_props([])
-            self.conf.set_activate([])
+            self.config.set_dsn([])
+            self.config.set_props([])
+            self.config.set_activate([])
             for device in devs:
                 device_sn = device['device']['dsn']
-                self.conf.append_dsn(device_sn)
+                self.config.append_dsn(device_sn)
                 self.log(f'Found Owlet monitor device serial number {device_sn}')
-                self.conf.append_props(
-                    f"{self.conf.get_region_config().get('url_base')}/dsns/{device_sn}/properties.json"
+                self.config.append_props(
+                    f"{self.config.get_region_config().get('url_base')}/dsns/{device_sn}/properties.json"
                 )
-                self.conf.append_activate(
-                    f"{self.conf.get_region_config().get('url_base')}/dsns/{device_sn}/properties/APP_ACTIVE/datapoints.json"
+                self.config.append_activate(
+                    f"{self.config.get_region_config().get('url_base')}/dsns/{device_sn}/properties/APP_ACTIVE/datapoints.json"
                 )
 
     def reactivate(self, url_activate):
         payload = {"datapoint": {"metadata": {}, "value": 1}}
-        r = self.conf.get_session().post(url_activate,
-                                         json=payload,
-                                         headers=self.conf.get_headers())
+        r = self.config.get_session().post(url_activate,
+                                           json=payload,
+                                           headers=self.config.get_headers())
         r.raise_for_status()
 
     def fetch_props(self):
         # Ayla cloud API data is updated only when APP_ACTIVE periodically reset to 1.
         my_props = []
         # Get properties for each device; note no pause between requests for each device
-        for device_sn, next_url_activate, next_url_props in zip(self.conf.get_dsn(), self.conf.get_activate(),
-                                                                self.conf.get_props()):
+        for device_sn, next_url_activate, next_url_props in zip(self.config.get_dsn(), self.config.get_activate(),
+                                                                self.config.get_props()):
             self.reactivate(next_url_activate)
             device_props = {'DSN': device_sn}
-            r = self.conf.get_session().get(next_url_props, headers=self.conf.get_headers())
+            r = self.config.get_session().get(next_url_props, headers=self.config.get_headers())
             r.raise_for_status()
             props = r.json()
             for prop in props:
@@ -208,6 +277,112 @@ class OwletClient:
 
         except Exception as e:
             print(f'exception: {format_exception(e)}')
+
+    async def _get_access_token(self, mini_token: str) -> Dict[str, Any]:
+        """Get access token from Ayla"""
+        url = self.config.region_config[self.config.region]['url_signin']
+        region_config = self.config.region_config[self.config.region]
+
+        data = {
+            "app_id": region_config['app_id'],
+            "app_secret": region_config['app_secret'],
+            "provider": "owl_id",
+            "token": mini_token,
+        }
+
+        try:
+            return await self._make_request('POST', url, json=data)
+        except Exception as e:
+            logger.error(f"Access token retrieval failed: {e}")
+            raise OwletError("Failed to get access token") from e
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def _make_request(
+        self,
+        method: str,
+        url: str,
+        **kwargs
+    ) -> ClientResponse:
+        session = await self._get_session()
+        async with session.request(method, url, **kwargs) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _authenticate_firebase(self) -> str:
+        """Authenticate against Firebase and get JWT token"""
+        api_key = self.config.region_config[self.config.region]['apiKey']
+        url = f'https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key={api_key}'
+
+        data = {
+            'email': self.config.user,
+            'password': self.config.password,
+            'returnSecureToken': True
+        }
+
+        try:
+            response = await self._make_request(
+                'POST',
+                url,
+                json=data,
+                headers=self.ANDROID_HEADERS
+            )
+            return response['idToken']
+        except Exception as e:
+            logger.error(f"Firebase authentication failed: {e}")
+            raise OwletError("Failed to authenticate with Firebase") from e
+
+    async def _get_mini_token(self, jwt: str) -> str:
+        """Get mini token from Owlet data service"""
+        url = self.config.region_config[self.config.region]['url_mini']
+        try:
+            response = await self._make_request(
+                'GET',
+                url,
+                headers={'Authorization': jwt}
+            )
+            return response['mini_token']
+        except Exception as e:
+            logger.error(f"Mini token retrieval failed: {e}")
+            raise OwletError("Failed to get mini token") from e
+
+    async def login(self) -> None:
+        """Main login flow implementation"""
+        try:
+            # Validate credentials
+            if not self.config.user or not self.config.password:
+                raise OwletError("Missing credentials")
+
+            # Check if token is still valid
+            if (self.config.auth_token and
+                    self.config.expire_time > datetime.now().timestamp()):
+                return
+
+            logger.info("Starting login process")
+
+            # Execute authentication flow
+            jwt = await self._authenticate_firebase()
+            mini_token = await self._get_mini_token(jwt)
+            auth_response = await self._get_access_token(mini_token)
+
+            # Update configuration with new tokens
+            self.config.auth_token = auth_response['access_token']
+            self.config.expire_time = (
+                    datetime.now().timestamp() +
+                    auth_response['expires_in'] - 60
+            )
+            self.config.add_headers({
+                'Authorization': f'auth_token {self.config.auth_token}'
+            })
+
+            logger.info("Login successful")
+
+        except Exception as e:
+            logger.error(f"Login failed: {e}")
+            raise OwletError(f"Login failed: {str(e)}") from e
 
     async def close(self):
         """Close the client session"""

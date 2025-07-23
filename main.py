@@ -1,35 +1,34 @@
+import asyncio
+import os
 import time
-
-import requests
 
 from api.client import OwletClient
 from utils.config import Config
 
-conf: Config | None = None
+if 'TERM' not in os.environ:
+    os.environ['TERM'] = 'xterm'
 
-def load_settings() -> None:
-    global conf
-    conf = Config()
+
+async def main() -> None:
+    config = Config()
+    client = OwletClient(config)
+    try:
+        await client.login()
+        #client.fetch_dsn()
+        await client.fetch_dsn_async()
+
+        while True:
+            for prop in client.fetch_props():
+                client.record_vitals(prop)
+            time.sleep(10)
+    except KeyboardInterrupt:
+        client.log('Exiting...')
+    except Exception as e:
+        client.log(f'Exception:{e}')
+    finally:
+        await client.close()
+
 
 if __name__ == "__main__":
-    load_settings()
-    client = OwletClient(conf)
-    conf.set_session()
-    client.log('Login success')
-
-    while True:
-        try:
-            client.login()
-            client.fetch_dsn()
-            for prop in client.fetch_props():
-                 client.record_vitals(prop)
-            time.sleep(10)
-        except requests.exceptions.RequestException as e:
-            client.log('Network error: %s' % e)
-            time.sleep(1)
-            conf.set_session()
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            client.log(f'Exception:{e}')
+    asyncio.run(main())
     
