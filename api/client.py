@@ -1,16 +1,25 @@
+import csv
 import json
 import os
+import platform
 import sys
 import time
+from datetime import datetime
+from traceback import format_exception
+
 import requests
 
+from api.utils import vitals_from_dict, VitalsAnalyzer
 from exceptions import OwletError
 from utils.config import Config
 
 
 class OwletClient:
+    analyzer: VitalsAnalyzer | None = None
+
     def __init__(self, config: Config = None):
         self.conf = config
+        self.analyzer = VitalsAnalyzer()
 
     def log(self, s) -> None:
         sys.stderr.write(s + '\n')
@@ -120,28 +129,88 @@ class OwletClient:
             my_props.append(device_props)
         return my_props
 
+    def clear_screen(self):
+        if platform.system() == "Windows":
+            os.system('cls')
+        else:
+            os.system('clear')
+
+    def save_to_csv(data):
+        filename = 'owlet_data.csv'
+        file_exists = os.path.isfile(filename)
+
+        with open(filename, mode='a', newline='') as file:
+            writer = csv.DictWriter(file, fieldnames=data.keys())
+
+            # Escribir encabezados solo si el archivo es nuevo
+            if not file_exists:
+                writer.writeheader()
+
+            writer.writerow(data)
+
     def record_vitals(self, p):
-        device_sn = p['DSN']
-        charge_status = p['CHARGE_STATUS']['value']
-        base_station_on = p['BASE_STATION_ON']['value']
-        heart = "%d" % p['HEART_RATE']['value']
-        oxy = "%d" % p['OXYGEN_LEVEL']['value']
-        mov = "wiggling" if p['MOVEMENT']['value'] else "still"
-        disp = "%d, " % time.time()
-        if charge_status >= 1:
-            disp += "sock charging (%d)" % charge_status
-            # base_station_on is (always?) 1 in this case
-        elif charge_status == 0:
-            if base_station_on == 0:
-                # sock was unplugged, but user did not turn on the base station.
-                # heart and oxygen levels appear to be reported, but we can't
-                # yet assume the sock was placed on the baby's foot.
-                disp += "sock not charging, base station off"
-            elif base_station_on == 1:
-                # base station was intentionally turned on, the sock is presumably
-                # on the baby's foot, so we can trust heart and oxygen levels
-                disp += heart + ", " + oxy + ", " + mov + ", " + device_sn
-                self.record(disp)
-            else:
-                raise OwletError("Unexpected base_station_on=%d" % base_station_on)
-        self.log("%s Status: " % device_sn + disp)
+        try:
+            device_sn = p['DSN']
+            real_time_vitals = p.get('REAL_TIME_VITALS')
+
+            if real_time_vitals is None:
+                self.log(f"No real-time vitals available for device {device_sn}")
+                return
+
+            vitals_value = real_time_vitals.get('value')
+            if not isinstance(vitals_value, dict):
+                # Try parsing as JSON if it's a string
+                try:
+                    if isinstance(vitals_value, str):
+                        vitals_value = json.loads(vitals_value)
+                    else:
+                        self.log(f"Invalid vitals data format for device {device_sn}")
+                        return
+                except json.JSONDecodeError:
+                    self.log(f"Could not parse vitals data for device {device_sn}")
+                    return
+
+            rtv = vitals_from_dict(vitals_value)
+            # print(f'rtv: {rtv}')
+            metrics = self.analyzer.add_measurement(rtv)
+
+            data = {
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'device_sn': device_sn,
+                'heart_rate': rtv.hr,
+                'movement': rtv.mv,
+                'oxygen': rtv.ox,
+                'battery': rtv.bat,
+                'stress_level': metrics.stress_level,
+                'sleep_quality': metrics.sleep_quality,
+                'breathing_status': metrics.breathing_status,
+                'activity_level': metrics.activity_level,
+                'overall_health': metrics.overall_health
+            }
+
+            # Guardar en CSV
+            #save_to_csv(data)
+            self.clear_screen()
+            # log(f'Device: {device_sn} | Heart: {rtv.hr} | Oxigen: {rtv.ox} | Movement: {rtv.mv} | Battery: {rtv.bat}')
+            # log(f'Full vitals values: {rtv.to_dict()}')
+            print(f"""
+                Estado del bebé:
+                - Latidos: {rtv.hr}
+                - Movimiento: {rtv.mv}
+                - Oxigeno: {rtv.ox}
+                - Nivel de bateria: {rtv.bat:.1f}%
+                - Nivel de estrés: {metrics.stress_level:.1f}%
+                - Calidad del sueño: {metrics.sleep_quality:.1f}%
+                - Estado respiratorio: {metrics.breathing_status}
+                - Nivel de actividad: {metrics.activity_level}
+                - Salud general: {metrics.overall_health:.1f}%
+                """)
+
+        except Exception as e:
+            print(f'exception: {format_exception(e)}')
+
+    async def close(self):
+        """Close the client session"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+

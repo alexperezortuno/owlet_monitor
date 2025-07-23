@@ -28,4 +28,8 @@ if __name__ == "__main__":
             client.log('Network error: %s' % e)
             time.sleep(1)
             conf.set_session()
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            client.log(f'Exception:{e}')
     
