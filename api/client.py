@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import os
 import platform
@@ -15,11 +16,11 @@ import aiohttp
 from aiohttp import ClientResponse
 
 from api.utils import VitalsAnalyzer, vitals_from_dict
-from exceptions import OwletError
+from exceptions import OwletError, PropertyFetchError
 from utils.config import Config
 
-
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class AuthResponse:
@@ -28,11 +29,13 @@ class AuthResponse:
     access_token: str
     expires_in: int
 
+
 @dataclass
 class DeviceEndpoints:
     dsn: str
     properties_url: str
     activate_url: str
+
 
 class DeviceManager:
     def __init__(self):
@@ -47,6 +50,26 @@ class DeviceManager:
     def set_devices(self, devices: List[DeviceEndpoints]) -> None:
         self.devices = devices
 
+
+@dataclass
+class DeviceProperties:
+    dsn: str
+    properties: Dict[str, Any]
+
+    @classmethod
+    def create(cls, dsn: str, props_data: List[Dict[str, Any]]) -> 'DeviceProperties':
+        """
+        Factory method to create DeviceProperties from raw data
+        """
+        properties = {'DSN': dsn}
+        for prop in props_data:
+            if 'property' in prop and 'name' in prop['property']:
+                name = prop['property']['name']
+                prop_data = prop['property'].copy()
+                del prop_data['name']
+                properties[name] = prop_data
+
+        return cls(dsn=dsn, properties=properties)
 
 
 class OwletClient:
@@ -71,7 +94,7 @@ class OwletClient:
         sys.stdout.write(s + '\n')
         sys.stdout.flush()
 
-    async def fetch_dsn_async(self) -> List[DeviceEndpoints]:
+    async def fetch_dsn(self) -> List[DeviceEndpoints]:
         """
         Fetches Device Serial Numbers (DSN) and related endpoints for all available Owlet monitors.
 
@@ -149,30 +172,6 @@ class OwletClient:
             logger.error(f"Unexpected error while fetching DSN: {e}")
             raise OwletError(f"Unexpected error: {str(e)}") from e
 
-    def fetch_dsn(self):
-        if len(self.config.get_dsn()) == 0:
-            self.log('Getting DSN')
-            r = self.config.get_session().get(self.config.get_region_config().get('url_base') + '/devices.json',
-                                            headers=self.config.get_headers())
-            r.raise_for_status()
-            devs = r.json()
-            if len(devs) < 1:
-                raise OwletError('Found zero Owlet monitors')
-            # Allow for multiple devices
-            self.config.set_dsn([])
-            self.config.set_props([])
-            self.config.set_activate([])
-            for device in devs:
-                device_sn = device['device']['dsn']
-                self.config.append_dsn(device_sn)
-                self.log(f'Found Owlet monitor device serial number {device_sn}')
-                self.config.append_props(
-                    f"{self.config.get_region_config().get('url_base')}/dsns/{device_sn}/properties.json"
-                )
-                self.config.append_activate(
-                    f"{self.config.get_region_config().get('url_base')}/dsns/{device_sn}/properties/APP_ACTIVE/datapoints.json"
-                )
-
     def reactivate(self, url_activate):
         payload = {"datapoint": {"metadata": {}, "value": 1}}
         r = self.config.get_session().post(url_activate,
@@ -180,7 +179,7 @@ class OwletClient:
                                            headers=self.config.get_headers())
         r.raise_for_status()
 
-    def fetch_props(self):
+    async def fetch_props(self):
         # Ayla cloud API data is updated only when APP_ACTIVE periodically reset to 1.
         my_props = []
         # Get properties for each device; note no pause between requests for each device
@@ -188,9 +187,12 @@ class OwletClient:
                                                                 self.config.get_props()):
             self.reactivate(next_url_activate)
             device_props = {'DSN': device_sn}
-            r = self.config.get_session().get(next_url_props, headers=self.config.get_headers())
-            r.raise_for_status()
-            props = r.json()
+            r = await self._make_request(
+                'GET',
+                next_url_props,
+                headers=self.config.get_headers()
+            )
+            props = r
             for prop in props:
                 n = prop['property']['name']
                 del (prop['property']['name'])
@@ -258,7 +260,7 @@ class OwletClient:
             }
 
             # Guardar en CSV
-            #save_to_csv(data)
+            # save_to_csv(data)
             self.clear_screen()
             # log(f'Device: {device_sn} | Heart: {rtv.hr} | Oxigen: {rtv.ox} | Movement: {rtv.mv} | Battery: {rtv.bat}')
             # log(f'Full vitals values: {rtv.to_dict()}')
@@ -302,10 +304,10 @@ class OwletClient:
         return self._session
 
     async def _make_request(
-        self,
-        method: str,
-        url: str,
-        **kwargs
+            self,
+            method: str,
+            url: str,
+            **kwargs
     ) -> ClientResponse:
         session = await self._get_session()
         async with session.request(method, url, **kwargs) as response:

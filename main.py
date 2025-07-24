@@ -14,11 +14,10 @@ async def main() -> None:
     client = OwletClient(config)
     try:
         await client.login()
-        #client.fetch_dsn()
-        await client.fetch_dsn_async()
+        await client.fetch_dsn()
 
         while True:
-            for prop in client.fetch_props():
+            for prop in await client.fetch_props():
                 client.record_vitals(prop)
             time.sleep(10)
     except KeyboardInterrupt:
